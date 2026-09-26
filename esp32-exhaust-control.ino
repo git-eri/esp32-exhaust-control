@@ -48,15 +48,33 @@
   Notes:
     - BLE and Wi-Fi control the same internal controller state.
     - Emergency shutdown disables both Wi-Fi and BLE.
-    - A reset or power-cycle is required after emergency shutdown.
+    - Emergency state is stored persistently in ESP32 NVS.
+    - On reboot, stored emergency keeps Wi-Fi/BLE OFF.
+    - GPIO0 button (active LOW) clears emergency after release-then-press.
 */
 
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <WebServer.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <Preferences.h>
+
+// Set to true for serial debug output, false for completely silent UART.
+#define SERIAL_OUTPUT_ENABLED   true
+
+#if SERIAL_OUTPUT_ENABLED
+  #define SERIAL_LOG_BEGIN(baud) Serial.begin(baud)
+  #define SERIAL_PRINT(x) Serial.print(x)
+  #define SERIAL_PRINTLN(x) Serial.println(x)
+#else
+  #define SERIAL_LOG_BEGIN(baud) do {} while (0)
+  #define SERIAL_PRINT(x) do {} while (0)
+  #define SERIAL_PRINTLN(x) do {} while (0)
+#endif
+
 
 // ============================================================
 // HARDWARE CONFIGURATION
@@ -88,6 +106,11 @@
 #define AP_SSID                 "Exhaust-ESP32"
 #define AP_PASSWORD             "Exhaust123"
 #define AP_CHANNEL              6
+
+// Set to false for completely silent serial output.
+
+// Local hostname: http://exhaust.local
+#define MDNS_HOSTNAME           "exhaust"
 
 
 // ============================================================
@@ -123,13 +146,31 @@
 // EMERGENCY SHUTDOWN
 // ============================================================
 
+
 #define EMERGENCY_ENABLED       true
+
+// Physical emergency reset button.
+// Wire the button between GPIO0 and GND.
+// GPIO0 is active LOW and uses the internal pull-up.
+#define EMERGENCY_RESET_PIN     0
+#define EMERGENCY_RESET_HOLD_MS     5000UL
+
+// Persistent emergency state in ESP32 NVS (flash).
+#define NVS_NAMESPACE           "exhaust"
+#define NVS_EMERGENCY_KEY       "emergency"
 
 // ============================================================
 // GLOBALS
 // ============================================================
 
 WebServer server(80);
+Preferences preferences;
+
+bool communicationServicesStarted = false;
+
+bool emergencyResetButtonArmed = false;
+bool lastEmergencyResetButtonState = HIGH;
+unsigned long lastEmergencyResetButtonChangedAt = 0;
 
 enum ControlMode {
   MODE_AUTO,
@@ -170,8 +211,191 @@ volatile bool emergencyShutdownRequested = false;
 #endif
 
 // ============================================================
+// PERSISTENT EMERGENCY STATE
+// ============================================================
+
+void saveEmergencyState(bool active) {
+  if (!preferences.begin(NVS_NAMESPACE, false)) {
+    SERIAL_PRINTLN("NVS: ERROR opening namespace for write");
+    return;
+  }
+
+  preferences.putBool(NVS_EMERGENCY_KEY, active);
+  preferences.end();
+
+  SERIAL_PRINT("NVS: emergency = ");
+  SERIAL_PRINTLN(active ? "true" : "false");
+}
+
+bool loadEmergencyState() {
+  if (!preferences.begin(NVS_NAMESPACE, true)) {
+    SERIAL_PRINTLN("NVS: ERROR opening namespace for read");
+    return false;
+  }
+
+  bool active = preferences.getBool(NVS_EMERGENCY_KEY, false);
+  preferences.end();
+
+  SERIAL_PRINT("NVS: emergency = ");
+  SERIAL_PRINTLN(active ? "true" : "false");
+
+  return active;
+}
+
+// ============================================================
+// COMMUNICATION SERVICES
+// ============================================================
+
+void registerHttpRoutes() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/mode", HTTP_POST, handleMode);
+  server.on("/api/duty", HTTP_POST, handleDuty);
+
+  if (EMERGENCY_ENABLED) {
+    server.on("/api/emergency", HTTP_POST, handleEmergency);
+  }
+
+  server.on("/api/heartbeat", HTTP_POST, handleHeartbeat);
+
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not found");
+  });
+}
+
+void startCommunicationServices() {
+  if (communicationServicesStarted) return;
+  if (emergencyShutdown) return;
+
+  WiFi.mode(WIFI_AP);
+
+  WiFi.softAP(
+    AP_SSID,
+    AP_PASSWORD,
+    AP_CHANNEL,
+    AP_HIDE_SSID
+  );
+
+  IPAddress ip = WiFi.softAPIP();
+
+  // Start mDNS so http://exhaust.local can be used in addition
+  // to the direct AP address http://192.168.4.1.
+  startMdns();
+
+  setupBle();
+
+  registerHttpRoutes();
+  server.begin();
+
+  lastHeartbeat = millis();
+  lastBleStatus = millis();
+  communicationServicesStarted = true;
+
+  SERIAL_PRINTLN();
+  SERIAL_PRINTLN("==================================");
+  SERIAL_PRINTLN("Communication services STARTED");
+  SERIAL_PRINT("WiFi SSID: ");
+  SERIAL_PRINTLN(AP_SSID);
+  SERIAL_PRINT("WiFi IP:   ");
+  SERIAL_PRINTLN(ip);
+  SERIAL_PRINT("BLE name:  ");
+  SERIAL_PRINTLN(BLE_DEVICE_NAME);
+  SERIAL_PRINT("BLE UUID:  ");
+  SERIAL_PRINTLN(BLE_SERVICE_UUID);
+  SERIAL_PRINTLN("==================================");
+}
+
+void stopCommunicationServices() {
+  if (communicationServicesStarted) {
+    server.stop();
+  }
+
+  MDNS.end();
+
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  stopBle();
+
+  communicationServicesStarted = false;
+
+  SERIAL_PRINTLN("Communication services STOPPED");
+}
+
+// ============================================================
+// EMERGENCY RESET BUTTON
+// ============================================================
+
+void clearEmergencyAndRestart() {
+  SERIAL_PRINTLN("Physical emergency reset accepted");
+
+  // Clear persistent emergency state first.
+  saveEmergencyState(false);
+
+  emergencyShutdown = false;
+  emergencyShutdownRequested = false;
+
+  currentMode = MODE_AUTO;
+  manualDutyPercent = 0;
+
+  // Always return to safe AUTO outputs.
+  setRelay(false);
+  pwmOff();
+  digitalWrite(STATUS_LED_PIN, LED_OFF);
+
+  // Keep the button logic disarmed until the current press is released.
+  emergencyResetButtonArmed = false;
+  lastEmergencyResetButtonState = digitalRead(EMERGENCY_RESET_PIN);
+  lastEmergencyResetButtonChangedAt = millis();
+
+  startCommunicationServices();
+
+  SERIAL_PRINTLN("Emergency cleared -> AUTO");
+}
+
+void handleEmergencyResetButton() {
+  if (!emergencyShutdown) return;
+
+  const bool pressed = (digitalRead(EMERGENCY_RESET_PIN) == LOW);
+  const unsigned long now = millis();
+
+  // IMPORTANT:
+  // If GPIO0 was held during boot, do not clear emergency immediately.
+  // First require a full release, then a new press.
+  if (!emergencyResetButtonArmed) {
+    if (!pressed) {
+      emergencyResetButtonArmed = true;
+      lastEmergencyResetButtonState = HIGH;
+      lastEmergencyResetButtonChangedAt = now;
+
+      SERIAL_PRINTLN("Emergency reset button armed (released)");
+    }
+    return;
+  }
+
+  // Detect button state changes.
+  const bool lastPressed = (lastEmergencyResetButtonState == LOW);
+
+  if (pressed != lastPressed) {
+    lastEmergencyResetButtonState = pressed ? LOW : HIGH;
+    lastEmergencyResetButtonChangedAt = now;
+
+    if (pressed) {
+      SERIAL_PRINTLN("Emergency reset button pressed - hold for 5 seconds");
+    }
+  }
+
+  // Emergency is cleared only after a continuous 5-second press.
+  if (pressed &&
+      (now - lastEmergencyResetButtonChangedAt >= EMERGENCY_RESET_HOLD_MS)) {
+    clearEmergencyAndRestart();
+  }
+}
+
+// ============================================================
 // PWM FUNCTIONS
 // ============================================================
+
 
 void pwmOff() {
 #ifdef USE_LEDC_OLD_API
@@ -183,9 +407,12 @@ void pwmOff() {
 
 void pwmWritePercent(uint8_t percent) {
   if (percent > 100) percent = 100;
+  
+  uint8_t invertedPercent = 100 - percent;
 
   const uint32_t maxDuty = (1UL << PWM_RESOLUTION_BITS) - 1UL;
-  const uint32_t duty = ((uint32_t)percent * maxDuty) / 100UL;
+  const uint32_t duty =
+      ((uint32_t)invertedPercent * maxDuty) / 100UL;
 
 #ifdef USE_LEDC_OLD_API
   ledcWrite(PWM_CHANNEL, duty);
@@ -322,7 +549,7 @@ class ExhaustBLEServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* server) override {
     bleClientConnected = true;
 
-    Serial.println("BLE: client connected");
+    SERIAL_PRINTLN("BLE: client connected");
 
     bleNotifyStatus();
   }
@@ -330,11 +557,11 @@ class ExhaustBLEServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer* server) override {
     bleClientConnected = false;
 
-    Serial.println("BLE: client disconnected");
+    SERIAL_PRINTLN("BLE: client disconnected");
 
     if (!emergencyShutdown) {
       server->getAdvertising()->start();
-      Serial.println("BLE: advertising restarted");
+      SERIAL_PRINTLN("BLE: advertising restarted");
     }
   }
 };
@@ -347,8 +574,8 @@ void processCommand(String command) {
 
   if (command.length() == 0) return;
 
-  Serial.print("BLE command: ");
-  Serial.println(command);
+  SERIAL_PRINT("BLE command: ");
+  SERIAL_PRINTLN(command);
 
   if (command == "HEARTBEAT") {
     lastHeartbeat = millis();
@@ -399,7 +626,7 @@ void processCommand(String command) {
     return;
   }
 
-  Serial.println("BLE: unknown command");
+  SERIAL_PRINTLN("BLE: unknown command");
 }
 
 class ExhaustBLECommandCallbacks : public BLECharacteristicCallbacks {
@@ -472,11 +699,11 @@ void setupBle() {
 
   BLEDevice::startAdvertising();
 
-  Serial.println("BLE: initialized");
-  Serial.print("BLE name: ");
-  Serial.println(BLE_DEVICE_NAME);
-  Serial.print("BLE service UUID: ");
-  Serial.println(BLE_SERVICE_UUID);
+  SERIAL_PRINTLN("BLE: initialized");
+  SERIAL_PRINT("BLE name: ");
+  SERIAL_PRINTLN(BLE_DEVICE_NAME);
+  SERIAL_PRINT("BLE service UUID: ");
+  SERIAL_PRINTLN(BLE_SERVICE_UUID);
 }
 
 void stopBle() {
@@ -493,7 +720,7 @@ void stopBle() {
   bleCommandCharacteristic = nullptr;
   bleStatusCharacteristic = nullptr;
 
-  Serial.println("BLE: OFF");
+  SERIAL_PRINTLN("BLE: OFF");
 }
 
 // ============================================================
@@ -511,22 +738,20 @@ void emergencyShutdownNow() {
   pwmOff();
   digitalWrite(STATUS_LED_PIN, LED_OFF);
 
-  Serial.println("==================================");
-  Serial.println("EMERGENCY SHUTDOWN");
-  Serial.println("Relay: OFF");
-  Serial.println("PWM:   OFF");
-  Serial.println("WiFi:  OFF");
-  Serial.println("BLE:   OFF");
-  Serial.println("Reset/power-cycle required.");
-  Serial.println("==================================");
+  // Persist the emergency state so it survives power cycles.
+  saveEmergencyState(true);
+
+  SERIAL_PRINTLN("==================================");
+  SERIAL_PRINTLN("EMERGENCY SHUTDOWN");
+  SERIAL_PRINTLN("Relay: OFF");
+  SERIAL_PRINTLN("PWM:   OFF");
+  SERIAL_PRINTLN("WiFi:  OFF");
+  SERIAL_PRINTLN("BLE:   OFF");
+  SERIAL_PRINTLN("Hold physical GPIO0 button for 5 seconds to reset.");
+  SERIAL_PRINTLN("==================================");
 
   // Stop communication after the outputs are safe.
-  server.stop();
-
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_OFF);
-
-  stopBle();
+  stopCommunicationServices();
 }
 
 // ============================================================
@@ -887,7 +1112,7 @@ async function emergencyShutdown() {
         <p style="color:#9ba3b2">Relais AUS<br>PWM AUS<br>WLAN AUS</p>
         <p style="color:#9ba3b2;font-size:13px">
           ESP32 bleibt stromversorgt.<br>
-          Reset oder Power-Cycle zum Neustart.
+          Zum Zurücksetzen den physischen Taster an GPIO0 drücken.
         </p>
       </div>
     </div>`;
@@ -1003,21 +1228,43 @@ void handleHeartbeat() {
 }
 
 // ============================================================
+// mDNS
+// ============================================================
+
+void startMdns() {
+  if (MDNS.begin(MDNS_HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+
+    SERIAL_PRINT("mDNS: http://");
+    SERIAL_PRINT(MDNS_HOSTNAME);
+    SERIAL_PRINTLN(".local");
+  } else {
+    SERIAL_PRINTLN("mDNS: start failed");
+  }
+}
+
+// ============================================================
 // SETUP
 // ============================================================
 
 void setup() {
-  Serial.begin(115200);
+  SERIAL_LOG_BEGIN(115200);
   delay(200);
 
-  // Set safe outputs BEFORE enabling the rest of the system.
+  // ----------------------------------------------------------
+  // Hardware / safe outputs.
+  // ----------------------------------------------------------
+
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(STATUS_LED_PIN, OUTPUT);
+
+  // Physical emergency reset button:
+  // GPIO0 -> button -> GND
+  pinMode(EMERGENCY_RESET_PIN, INPUT_PULLUP);
 
   setRelay(false);
   digitalWrite(STATUS_LED_PIN, LED_OFF);
 
-  // Always boot in AUTO.
   currentMode = MODE_AUTO;
   manualDutyPercent = 0;
 
@@ -1025,100 +1272,90 @@ void setup() {
   applyOutputs();
 
   // ----------------------------------------------------------
-  // Start ESP32 Wi-Fi access point.
+  // Load persistent emergency state.
   // ----------------------------------------------------------
-
-  WiFi.mode(WIFI_AP);
-
-  WiFi.softAP(
-    AP_SSID,
-    AP_PASSWORD,
-    AP_CHANNEL,
-    AP_HIDE_SSID
-  );
-
-  IPAddress ip = WiFi.softAPIP();
-
-  // ----------------------------------------------------------
-  // Start BLE in parallel.
-  // ----------------------------------------------------------
-
-  setupBle();
-
-  // ----------------------------------------------------------
-  // Serial information.
-  // ----------------------------------------------------------
-
-  Serial.println();
-  Serial.println("==================================");
-  Serial.println("ESP32 Exhaust Controller");
-  Serial.println("==================================");
-
-  Serial.print("WiFi SSID: ");
-  Serial.println(AP_SSID);
-
-  Serial.print("WiFi IP:   ");
-  Serial.println(ip);
-
-  Serial.print("PWM pin:   ");
-  Serial.println(PWM_PIN);
-
-  Serial.print("PWM freq:  ");
-  Serial.print(PWM_FREQUENCY_HZ);
-  Serial.println(" Hz");
-
-  Serial.print("BLE name:  ");
-  Serial.println(BLE_DEVICE_NAME);
-
-  Serial.print("BLE UUID:  ");
-  Serial.println(BLE_SERVICE_UUID);
-
-  Serial.println("Mode: AUTO");
-  Serial.println("==================================");
-
-
-  // ----------------------------------------------------------
-  // Local HTTP API server.
-  // ----------------------------------------------------------
-
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/mode", HTTP_POST, handleMode);
-  server.on("/api/duty", HTTP_POST, handleDuty);
 
   if (EMERGENCY_ENABLED) {
-    server.on("/api/emergency", HTTP_POST, handleEmergency);
+    emergencyShutdown = loadEmergencyState();
+  } else {
+    emergencyShutdown = false;
   }
 
-  server.on("/api/heartbeat", HTTP_POST, handleHeartbeat);
+  emergencyShutdownRequested = false;
 
-  server.onNotFound([]() {
-    server.send(404, "text/plain", "Not found");
-  });
+  // If emergency was stored in NVS, stay completely offline.
+  if (emergencyShutdown) {
+    setRelay(false);
+    pwmOff();
+    digitalWrite(STATUS_LED_PIN, LED_OFF);
 
-  server.begin();
+    // Do NOT start Wi-Fi, BLE or HTTP server.
+    // The physical GPIO0 button is the only reset path.
+    emergencyResetButtonArmed = false;
+    lastEmergencyResetButtonState =
+      (digitalRead(EMERGENCY_RESET_PIN) == LOW) ? LOW : HIGH;
+    lastEmergencyResetButtonChangedAt = millis();
 
-  lastHeartbeat = millis();
-  lastBleStatus = millis();
+    SERIAL_PRINTLN();
+    SERIAL_PRINTLN("==================================");
+    SERIAL_PRINTLN("ESP32 Exhaust Controller");
+    SERIAL_PRINTLN("PERSISTENT EMERGENCY ACTIVE");
+    SERIAL_PRINTLN("Relay: OFF");
+    SERIAL_PRINTLN("PWM:   OFF");
+    SERIAL_PRINTLN("WiFi:  OFF");
+    SERIAL_PRINTLN("BLE:   OFF");
+    SERIAL_PRINTLN("Release GPIO0 first, then press it");
+    SERIAL_PRINTLN("to clear emergency.");
+    SERIAL_PRINTLN("==================================");
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Normal startup.
+  // ----------------------------------------------------------
+
+  startCommunicationServices();
+
+  SERIAL_PRINTLN();
+  SERIAL_PRINTLN("==================================");
+  SERIAL_PRINTLN("ESP32 Exhaust Controller");
+  SERIAL_PRINTLN("==================================");
+  SERIAL_PRINTLN("Mode: AUTO");
+  SERIAL_PRINTLN("==================================");
 }
+
 
 // ============================================================
 // LOOP
 // ============================================================
 
 void loop() {
-  // Emergency shutdown request may originate from either Wi-Fi or BLE.
-  if (emergencyShutdownRequested && !emergencyShutdown) {
-    emergencyShutdownNow();
-  }
+  // ----------------------------------------------------------
+  // Physical emergency reset button.
+  // This must also run while communications are OFF.
+  // ----------------------------------------------------------
 
   if (emergencyShutdown) {
-    // Keep outputs in the safe state even after communication is off.
-    setRelay(false);
-    pwmOff();
-    digitalWrite(STATUS_LED_PIN, LED_OFF);
+    handleEmergencyResetButton();
 
-    delay(10);
+    if (emergencyShutdown) {
+      // Keep outputs in the safe state.
+      setRelay(false);
+      pwmOff();
+      digitalWrite(STATUS_LED_PIN, LED_OFF);
+
+      delay(10);
+      return;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Emergency shutdown request may originate from Wi-Fi or BLE.
+  // ----------------------------------------------------------
+
+  if (emergencyShutdownRequested && !emergencyShutdown) {
+    emergencyShutdownNow();
     return;
   }
 
@@ -1126,13 +1363,16 @@ void loop() {
   // Wi-Fi web server.
   // ----------------------------------------------------------
 
-  server.handleClient();
+  if (communicationServicesStarted) {
+    server.handleClient();
+  }
 
   // ----------------------------------------------------------
   // BLE status notifications.
   // ----------------------------------------------------------
 
-  if (BLE_ENABLED &&
+  if (communicationServicesStarted &&
+      BLE_ENABLED &&
       bleClientConnected &&
       (millis() - lastBleStatus >= BLE_STATUS_INTERVAL_MS)) {
 
@@ -1144,11 +1384,12 @@ void loop() {
   // Optional communication failsafe.
   // ----------------------------------------------------------
 
-  if (FAILSAFE_ENABLED &&
+  if (communicationServicesStarted &&
+      FAILSAFE_ENABLED &&
       currentMode != MODE_AUTO &&
       (millis() - lastHeartbeat > FAILSAFE_TIMEOUT_MS)) {
 
-    Serial.println("FAILSAFE: No heartbeat -> AUTO");
+    SERIAL_PRINTLN("FAILSAFE: No heartbeat -> AUTO");
 
     setMode(MODE_AUTO);
     lastHeartbeat = millis();
