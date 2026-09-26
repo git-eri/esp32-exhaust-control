@@ -1114,6 +1114,13 @@ async function emergencyShutdown() {
           ESP32 bleibt stromversorgt.<br>
           Zum Zurücksetzen den physischen Taster an GPIO0 drücken.
         </p>
+        <button onclick="location.reload()"
+                style="margin-top:18px;width:100%;min-height:58px;padding:12px 18px;
+                       border:1px solid #303643;border-radius:14px;background:#222631;
+                       color:#fff;font-size:17px;font-weight:700;cursor:pointer;
+                       touch-action:manipulation;">
+          🔄 Aktualisieren
+        </button>
       </div>
     </div>`;
 }
