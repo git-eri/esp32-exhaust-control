@@ -89,7 +89,7 @@
 
 // These are the current working values.
 // Confirm the correct vehicle-side behavior with your measurements.
-#define OPEN_PWM_DUTY_PERCENT   90
+#define OPEN_PWM_DUTY_PERCENT   85
 #define CLOSED_PWM_DUTY_PERCENT 10
 
 #define RELAY_ON                HIGH
