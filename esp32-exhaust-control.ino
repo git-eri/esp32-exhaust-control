@@ -11,59 +11,30 @@
   Modes:
     AUTO   = relay OFF, PWM OFF
     OPEN   = relay ON, PWM at OPEN_PWM_DUTY_PERCENT
-    MANUAL = relay ON, PWM controlled by slider 0..100 %
 
   Communication:
     1) Wi-Fi AP + Web UI
-    2) Bluetooth Low Energy (BLE) in parallel
-       - intended as a fallback / alternative control path
-       - compatible with Web Bluetooth clients such as Bluefy
 
   IMPORTANT:
     GPIO25 is a 3.3 V logic output. Do NOT connect it directly to a 12 V circuit.
     Use the intended transistor/driver stage between GPIO25 and the vehicle's
     12 V PWM input.
 
-  BLE protocol:
-    Service UUID:
-      7f6e0001-6d8b-4c7a-9a11-3e5c2b8d1001
-
-    Command characteristic (WRITE / WRITE WITHOUT RESPONSE):
-      7f6e0002-6d8b-4c7a-9a11-3e5c2b8d1001
-
-    Status characteristic (READ / NOTIFY):
-      7f6e0003-6d8b-4c7a-9a11-3e5c2b8d1001
-
-    Commands are plain UTF-8 text:
-      MODE:AUTO
-      MODE:OPEN
-      MODE:MANUAL
-      DUTY:0..100
-      HEARTBEAT
-      EMERGENCY
-
-    Status is JSON, for example:
-      {"mode":"MANUAL","duty":50,"relay":true,"frequency":100,"failsafe":true}
-
   Notes:
-    - BLE and Wi-Fi control the same internal controller state.
-    - Emergency shutdown disables both Wi-Fi and BLE.
+    - Emergency shutdown disables Wi-Fi.
     - Emergency state is stored persistently in ESP32 NVS.
-    - On reboot, stored emergency keeps Wi-Fi/BLE OFF.
+    - On reboot, stored emergency keeps Wi-Fi OFF.
     - GPIO0 button (active LOW) clears emergency after release-then-press.
 */
 
 #include <WiFi.h>
+#include <esp_netif.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
 #include <Preferences.h>
 
 // Set to true for serial debug output, false for completely silent UART.
-#define SERIAL_OUTPUT_ENABLED   true
+#define SERIAL_OUTPUT_ENABLED   false
 
 #if SERIAL_OUTPUT_ENABLED
   #define SERIAL_LOG_BEGIN(baud) Serial.begin(baud)
@@ -90,7 +61,6 @@
 // These are the current working values.
 // Confirm the correct vehicle-side behavior with your measurements.
 #define OPEN_PWM_DUTY_PERCENT   85
-#define CLOSED_PWM_DUTY_PERCENT 10
 
 #define RELAY_ON                HIGH
 #define RELAY_OFF               LOW
@@ -103,39 +73,22 @@
 // ============================================================
 
 #define AP_HIDE_SSID            false
-#define AP_SSID                 "Exhaust-ESP32"
+#define AP_SSID                 "WiFi"
 #define AP_PASSWORD             "Exhaust123"
 #define AP_CHANNEL              6
-
-// Set to false for completely silent serial output.
 
 // Local hostname: http://exhaust.local
 #define MDNS_HOSTNAME           "exhaust"
 
 
 // ============================================================
-// BLUETOOTH LOW ENERGY CONFIGURATION
-// ============================================================
-
-#define BLE_ENABLED             false
-#define BLE_DEVICE_NAME         "Exhaust-ESP32"
-
-#define BLE_SERVICE_UUID        "7f6e0001-6d8b-4c7a-9a11-3e5c2b8d1001"
-#define BLE_COMMAND_UUID        "7f6e0002-6d8b-4c7a-9a11-3e5c2b8d1001"
-#define BLE_STATUS_UUID         "7f6e0003-6d8b-4c7a-9a11-3e5c2b8d1001"
-
-// Send status notifications periodically when a BLE client is connected.
-#define BLE_STATUS_INTERVAL_MS  500UL
-
-// ============================================================
 // OPTIONAL FAILSAFE
 // ============================================================
 
-// If enabled, AUTO is selected when neither communication path
-// has refreshed the heartbeat within FAILSAFE_TIMEOUT_MS.
+// If enabled, AUTO is selected when the web UI has not refreshed
+// the heartbeat within FAILSAFE_TIMEOUT_MS.
 //
 // The web UI sends a heartbeat every 5 seconds.
-// A BLE client should send "HEARTBEAT" periodically.
 //
 // IMPORTANT:
 // This is NOT a substitute for proper electrical/mechanical safety.
@@ -158,6 +111,8 @@
 // Persistent emergency state in ESP32 NVS (flash).
 #define NVS_NAMESPACE           "exhaust"
 #define NVS_EMERGENCY_KEY       "emergency"
+#define NVS_REMEMBER_MODE_KEY   "rememberMode"
+#define NVS_START_MODE_KEY      "startMode"
 
 // ============================================================
 // GLOBALS
@@ -174,27 +129,18 @@ unsigned long lastEmergencyResetButtonChangedAt = 0;
 
 enum ControlMode {
   MODE_AUTO,
-  MODE_OPEN,
-  MODE_MANUAL
+  MODE_OPEN
 };
 
 ControlMode currentMode = MODE_AUTO;
-uint8_t manualDutyPercent = 0;
+bool rememberLastMode = false;
+ControlMode rememberedMode = MODE_AUTO;
 
 unsigned long lastHeartbeat = 0;
-unsigned long lastBleStatus = 0;
 
 bool emergencyShutdown = false;
 
-// BLE objects
-BLEServer* bleServer = nullptr;
-BLECharacteristic* bleCommandCharacteristic = nullptr;
-BLECharacteristic* bleStatusCharacteristic = nullptr;
-
-bool bleClientConnected = false;
-
-// BLE callbacks only set this flag. The actual shutdown is performed
-// from loop(), after the callback has returned.
+// HTTP emergency request is handled in loop() after the HTTP response.
 volatile bool emergencyShutdownRequested = false;
 
 // LEDC channel is only needed with Arduino-ESP32 2.x.
@@ -243,6 +189,105 @@ bool loadEmergencyState() {
 }
 
 // ============================================================
+// PERSISTENT START MODE
+// ============================================================
+
+void saveModePreference(bool remember, ControlMode mode) {
+  if (!preferences.begin(NVS_NAMESPACE, false)) {
+    SERIAL_PRINTLN("NVS: ERROR opening namespace for mode preference");
+    return;
+  }
+
+  preferences.putBool(NVS_REMEMBER_MODE_KEY, remember);
+
+  if (remember && (mode == MODE_AUTO || mode == MODE_OPEN)) {
+    preferences.putUChar(NVS_START_MODE_KEY, static_cast<uint8_t>(mode));
+  }
+
+  preferences.end();
+
+  SERIAL_PRINT("NVS: remember mode = ");
+  SERIAL_PRINTLN(remember ? "true" : "false");
+}
+
+void loadModePreference() {
+  if (!preferences.begin(NVS_NAMESPACE, true)) {
+    SERIAL_PRINTLN("NVS: ERROR opening namespace for mode preference read");
+    rememberLastMode = false;
+    rememberedMode = MODE_AUTO;
+    return;
+  }
+
+  rememberLastMode = preferences.getBool(NVS_REMEMBER_MODE_KEY, false);
+
+  uint8_t storedMode =
+    preferences.getUChar(NVS_START_MODE_KEY, static_cast<uint8_t>(MODE_AUTO));
+
+  preferences.end();
+
+  if (storedMode == static_cast<uint8_t>(MODE_OPEN)) {
+    rememberedMode = MODE_OPEN;
+  } else {
+    rememberedMode = MODE_AUTO;
+  }
+
+  SERIAL_PRINT("NVS: remember mode = ");
+  SERIAL_PRINTLN(rememberLastMode ? "true" : "false");
+
+  SERIAL_PRINT("NVS: startup mode = ");
+  SERIAL_PRINTLN(rememberedMode == MODE_OPEN ? "OPEN" : "AUTO");
+}
+
+// ============================================================
+// SOFTAP DHCP CONFIGURATION
+// ============================================================
+
+// Do not advertise the ESP32 as the client's default gateway.
+// This keeps the Wi-Fi connection available for local access to the
+// controller while allowing the iPhone to keep using mobile data for
+// Internet traffic. DHCP Option 3 (Router) is disabled explicitly.
+void configureSoftApDhcpNoDefaultGateway() {
+  esp_netif_t* apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+
+  if (apNetif == nullptr) {
+    SERIAL_PRINTLN("WiFi DHCP: WIFI_AP_DEF not found");
+    return;
+  }
+
+  esp_err_t err = esp_netif_dhcps_stop(apNetif);
+
+  if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+    SERIAL_PRINT("WiFi DHCP: stop failed: ");
+    SERIAL_PRINTLN(esp_err_to_name(err));
+    return;
+  }
+
+  uint8_t routerOptionEnabled = 0;
+
+  err = esp_netif_dhcps_option(
+    apNetif,
+    ESP_NETIF_OP_SET,
+    ESP_NETIF_ROUTER_SOLICITATION_ADDRESS,
+    &routerOptionEnabled,
+    sizeof(routerOptionEnabled)
+  );
+
+  if (err != ESP_OK) {
+    SERIAL_PRINT("WiFi DHCP: disabling Router option failed: ");
+    SERIAL_PRINTLN(esp_err_to_name(err));
+  } else {
+    SERIAL_PRINTLN("WiFi DHCP: Default Gateway / DHCP Option 3 disabled");
+  }
+
+  err = esp_netif_dhcps_start(apNetif);
+
+  if (err != ESP_OK) {
+    SERIAL_PRINT("WiFi DHCP: restart failed: ");
+    SERIAL_PRINTLN(esp_err_to_name(err));
+  }
+}
+
+// ============================================================
 // COMMUNICATION SERVICES
 // ============================================================
 
@@ -250,7 +295,7 @@ void registerHttpRoutes() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/mode", HTTP_POST, handleMode);
-  server.on("/api/duty", HTTP_POST, handleDuty);
+  server.on("/api/preferences", HTTP_POST, handlePreferences);
 
   if (EMERGENCY_ENABLED) {
     server.on("/api/emergency", HTTP_POST, handleEmergency);
@@ -276,19 +321,21 @@ void startCommunicationServices() {
     AP_HIDE_SSID
   );
 
+  // Important for iPhone/iOS: do not advertise the ESP32 as the
+  // default gateway. Local traffic to 192.168.4.1 still works,
+  // while Internet traffic can remain on the mobile-data connection.
+  configureSoftApDhcpNoDefaultGateway();
+
   IPAddress ip = WiFi.softAPIP();
 
   // Start mDNS so http://exhaust.local can be used in addition
   // to the direct AP address http://192.168.4.1.
   startMdns();
 
-  setupBle();
-
   registerHttpRoutes();
   server.begin();
 
   lastHeartbeat = millis();
-  lastBleStatus = millis();
   communicationServicesStarted = true;
 
   SERIAL_PRINTLN();
@@ -298,10 +345,6 @@ void startCommunicationServices() {
   SERIAL_PRINTLN(AP_SSID);
   SERIAL_PRINT("WiFi IP:   ");
   SERIAL_PRINTLN(ip);
-  SERIAL_PRINT("BLE name:  ");
-  SERIAL_PRINTLN(BLE_DEVICE_NAME);
-  SERIAL_PRINT("BLE UUID:  ");
-  SERIAL_PRINTLN(BLE_SERVICE_UUID);
   SERIAL_PRINTLN("==================================");
 }
 
@@ -314,8 +357,6 @@ void stopCommunicationServices() {
 
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
-
-  stopBle();
 
   communicationServicesStarted = false;
 
@@ -336,7 +377,6 @@ void clearEmergencyAndRestart() {
   emergencyShutdownRequested = false;
 
   currentMode = MODE_AUTO;
-  manualDutyPercent = 0;
 
   // Always return to safe AUTO outputs.
   setRelay(false);
@@ -461,20 +501,13 @@ void applyOutputs() {
       pwmWritePercent(OPEN_PWM_DUTY_PERCENT);
       digitalWrite(STATUS_LED_PIN, LED_ON);
       break;
-
-    case MODE_MANUAL:
-      setRelay(true);
-      pwmWritePercent(manualDutyPercent);
-      digitalWrite(STATUS_LED_PIN, LED_ON);
-      break;
   }
 }
 
 const char* modeToString() {
   switch (currentMode) {
-    case MODE_AUTO:   return "AUTO";
-    case MODE_OPEN:   return "OPEN";
-    case MODE_MANUAL: return "MANUAL";
+    case MODE_AUTO: return "AUTO";
+    case MODE_OPEN: return "OPEN";
   }
   return "AUTO";
 }
@@ -482,7 +515,17 @@ const char* modeToString() {
 void setMode(ControlMode mode) {
   if (emergencyShutdown) return;
 
+  if (mode != MODE_AUTO && mode != MODE_OPEN) {
+    return;
+  }
+
   currentMode = mode;
+
+  if (rememberLastMode && rememberedMode != mode) {
+    rememberedMode = mode;
+    saveModePreference(true, rememberedMode);
+  }
+
   applyOutputs();
 }
 
@@ -495,8 +538,6 @@ String makeStatusJson() {
 
   if (currentMode == MODE_OPEN) {
     effectiveDuty = OPEN_PWM_DUTY_PERCENT;
-  } else if (currentMode == MODE_MANUAL) {
-    effectiveDuty = manualDutyPercent;
   }
 
   String json = "{";
@@ -515,212 +556,14 @@ String makeStatusJson() {
   json += "\"failsafe\":";
   json += (FAILSAFE_ENABLED ? "true" : "false");
   json += ",";
-  json += "\"ble\":";
-  json += (bleClientConnected ? "true" : "false");
-  json += ",";
   json += "\"emergency\":";
   json += (emergencyShutdown ? "true" : "false");
+  json += ",";
+  json += "\"rememberMode\":";
+  json += (rememberLastMode ? "true" : "false");
   json += "}";
 
   return json;
-}
-
-// ============================================================
-// BLE STATUS
-// ============================================================
-
-void bleNotifyStatus() {
-  if (!BLE_ENABLED) return;
-  if (!bleClientConnected) return;
-  if (bleStatusCharacteristic == nullptr) return;
-  if (emergencyShutdown) return;
-
-  String status = makeStatusJson();
-
-  bleStatusCharacteristic->setValue(status.c_str());
-  bleStatusCharacteristic->notify();
-}
-
-// ============================================================
-// BLE SERVER CALLBACKS
-// ============================================================
-
-class ExhaustBLEServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* server) override {
-    bleClientConnected = true;
-
-    SERIAL_PRINTLN("BLE: client connected");
-
-    bleNotifyStatus();
-  }
-
-  void onDisconnect(BLEServer* server) override {
-    bleClientConnected = false;
-
-    SERIAL_PRINTLN("BLE: client disconnected");
-
-    if (!emergencyShutdown) {
-      server->getAdvertising()->start();
-      SERIAL_PRINTLN("BLE: advertising restarted");
-    }
-  }
-};
-
-void processCommand(String command) {
-  if (emergencyShutdown) return;
-
-  command.trim();
-  command.toUpperCase();
-
-  if (command.length() == 0) return;
-
-  SERIAL_PRINT("BLE command: ");
-  SERIAL_PRINTLN(command);
-
-  if (command == "HEARTBEAT") {
-    lastHeartbeat = millis();
-    bleNotifyStatus();
-    return;
-  }
-
-  if (command == "EMERGENCY") {
-    if (EMERGENCY_ENABLED) {
-      emergencyShutdownRequested = true;
-    }
-    return;
-  }
-
-  if (command == "MODE:AUTO") {
-    setMode(MODE_AUTO);
-    lastHeartbeat = millis();
-    bleNotifyStatus();
-    return;
-  }
-
-  if (command == "MODE:OPEN") {
-    setMode(MODE_OPEN);
-    lastHeartbeat = millis();
-    bleNotifyStatus();
-    return;
-  }
-
-  if (command == "MODE:MANUAL") {
-    setMode(MODE_MANUAL);
-    lastHeartbeat = millis();
-    bleNotifyStatus();
-    return;
-  }
-
-  if (command.startsWith("DUTY:")) {
-    String valueString = command.substring(5);
-    int value = valueString.toInt();
-
-    if (value < 0) value = 0;
-    if (value > 100) value = 100;
-
-    manualDutyPercent = (uint8_t)value;
-    setMode(MODE_MANUAL);
-    lastHeartbeat = millis();
-
-    bleNotifyStatus();
-    return;
-  }
-
-  SERIAL_PRINTLN("BLE: unknown command");
-}
-
-class ExhaustBLECommandCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* characteristic) override {
-    String command = characteristic->getValue();
-
-    if (command.length() == 0) return;
-
-    // Allow one or more newline-separated commands.
-    int start = 0;
-
-    while (start < command.length()) {
-      int end = command.indexOf('\n', start);
-
-      if (end < 0) {
-        end = command.length();
-      }
-
-      String oneCommand = command.substring(start, end);
-      oneCommand.trim();
-
-      if (oneCommand.length() > 0) {
-        processCommand(oneCommand);
-      }
-
-      start = end + 1;
-    }
-  }
-};
-
-void setupBle() {
-  if (!BLE_ENABLED) return;
-
-  BLEDevice::init(BLE_DEVICE_NAME);
-
-  bleServer = BLEDevice::createServer();
-  bleServer->setCallbacks(new ExhaustBLEServerCallbacks());
-
-  BLEService* service = bleServer->createService(BLE_SERVICE_UUID);
-
-  bleCommandCharacteristic = service->createCharacteristic(
-    BLE_COMMAND_UUID,
-    BLECharacteristic::PROPERTY_WRITE |
-    BLECharacteristic::PROPERTY_WRITE_NR
-  );
-
-  bleCommandCharacteristic->setCallbacks(
-    new ExhaustBLECommandCallbacks()
-  );
-
-  bleStatusCharacteristic = service->createCharacteristic(
-    BLE_STATUS_UUID,
-    BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-
-  // Required by many Web Bluetooth clients for notifications.
-  bleStatusCharacteristic->addDescriptor(new BLE2902());
-
-  bleStatusCharacteristic->setValue(makeStatusJson().c_str());
-
-  service->start();
-
-  BLEAdvertising* advertising = BLEDevice::getAdvertising();
-
-  advertising->addServiceUUID(BLE_SERVICE_UUID);
-  advertising->setScanResponse(true);
-  advertising->setMinPreferred(0x06);
-  advertising->setMinPreferred(0x12);
-
-  BLEDevice::startAdvertising();
-
-  SERIAL_PRINTLN("BLE: initialized");
-  SERIAL_PRINT("BLE name: ");
-  SERIAL_PRINTLN(BLE_DEVICE_NAME);
-  SERIAL_PRINT("BLE service UUID: ");
-  SERIAL_PRINTLN(BLE_SERVICE_UUID);
-}
-
-void stopBle() {
-  if (!BLE_ENABLED) return;
-
-  bleClientConnected = false;
-
-  BLEDevice::stopAdvertising();
-
-  // Release the BLE stack.
-  BLEDevice::deinit(true);
-
-  bleServer = nullptr;
-  bleCommandCharacteristic = nullptr;
-  bleStatusCharacteristic = nullptr;
-
-  SERIAL_PRINTLN("BLE: OFF");
 }
 
 // ============================================================
@@ -746,7 +589,6 @@ void emergencyShutdownNow() {
   SERIAL_PRINTLN("Relay: OFF");
   SERIAL_PRINTLN("PWM:   OFF");
   SERIAL_PRINTLN("WiFi:  OFF");
-  SERIAL_PRINTLN("BLE:   OFF");
   SERIAL_PRINTLN("Hold physical GPIO0 button for 5 seconds to reset.");
   SERIAL_PRINTLN("==================================");
 
@@ -759,7 +601,7 @@ void emergencyShutdownNow() {
 // ============================================================
 
 // Local WLAN web UI.
-// This page uses only the local HTTP API and contains no BLE/Web-Bluetooth code.
+// This page uses only the local HTTP API.
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="de">
@@ -844,8 +686,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
   .modes {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 9px;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .modes button {
+    min-height: 110px;
+    font-size: 28px;
+    font-weight: 800;
   }
 
   .emergency {
@@ -887,34 +735,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     color: white;
   }
 
-  .manual {
-    display: none;
-  }
-
-  .manual.visible {
-    display: block;
-  }
-
-  .value {
-    text-align: center;
-    font-size: 48px;
-    font-weight: 800;
-    margin: 4px 0 14px;
-  }
-
-  input[type=range] {
-    width: 100%;
-    height: 44px;
-    accent-color: var(--accent);
-  }
-
-  .range-labels {
-    display: flex;
-    justify-content: space-between;
-    color: var(--muted);
-    font-size: 13px;
-  }
-
   .stats {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -950,13 +770,30 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <body>
 <div class="wrap">
 
-  <div class="card">
-    <button class="emergency" onclick="emergencyShutdown()">⚠ EMERGENCY OFF</button>
-    <div class="emergency-hint">Relais AUS · PWM AUS · WLAN AUS</div>
-  </div>
-
   <h1>Exhaust Control</h1>
   <div class="subtitle">ESP32 Controller</div>
+
+  <div class="card">
+    <button class="emergency" onclick="emergencyShutdown()">⚠ NOT AUS</button>
+  </div>
+
+  <div class="card">
+    <div class="modes">
+      <button id="btnAuto" onclick="setMode('AUTO')">AUTO</button>
+      <button id="btnOpen" onclick="setMode('OPEN')">OFFEN</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <label style="display:flex;align-items:center;gap:12px;cursor:pointer;">
+      <input id="rememberMode" type="checkbox"
+             onchange="setRememberMode(this.checked)"
+             style="width:22px;height:22px;accent-color:var(--accent);">
+      <span>
+        <strong>Letzte Einstellung merken</strong><br>
+      </span>
+    </label>
+  </div>
 
   <div class="card">
     <div class="connection">
@@ -964,35 +801,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <span id="connectionText">Verbunden</span>
     </div>
     <div id="transportText" class="transport">Lokales WLAN</div>
-  </div>
-
-  <div class="card">
-    <div class="modes">
-      <button id="btnAuto" onclick="setMode('AUTO')">AUTO</button>
-      <button id="btnOpen" onclick="setMode('OPEN')">OPEN</button>
-      <button id="btnManual" onclick="setMode('MANUAL')">MANUAL</button>
-    </div>
-  </div>
-
-  <div id="manualCard" class="card manual">
-    <div style="text-align:center;color:#9ba3b2;margin-bottom:3px">
-      Manuelle PWM
-    </div>
-
-    <div id="dutyValue" class="value">0 %</div>
-
-    <input id="slider"
-           type="range"
-           min="0"
-           max="100"
-           value="0"
-           step="1"
-           oninput="sliderChanged(this.value)">
-
-    <div class="range-labels">
-      <span>0 %</span>
-      <span>100 %</span>
-    </div>
   </div>
 
   <div class="card">
@@ -1019,17 +827,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
-  <div class="warning">
-    AUTO schaltet das Relais ab und deaktiviert die PWM-Ausgabe.
-    Die 12-V-PWM muss über eine geeignete Treiber-/Transistorschaltung
-    erzeugt werden.
-  </div>
-
 </div>
 
 <script>
 let currentMode = 'AUTO';
-let sliderTimer = null;
 
 function updateUI(data) {
   currentMode = data.mode;
@@ -1041,15 +842,7 @@ function updateUI(data) {
 
   document.getElementById('btnAuto').classList.toggle('active', data.mode === 'AUTO');
   document.getElementById('btnOpen').classList.toggle('active', data.mode === 'OPEN');
-  document.getElementById('btnManual').classList.toggle('active', data.mode === 'MANUAL');
-
-  const manualCard = document.getElementById('manualCard');
-  manualCard.classList.toggle('visible', data.mode === 'MANUAL');
-
-  if (data.mode === 'MANUAL') {
-    document.getElementById('slider').value = data.duty;
-    document.getElementById('dutyValue').textContent = data.duty + ' %';
-  }
+  document.getElementById('rememberMode').checked = !!data.rememberMode;
 
   document.getElementById('connectionText').textContent = 'Verbunden';
   document.getElementById('transportText').textContent = 'Lokales WLAN';
@@ -1076,20 +869,22 @@ async function setMode(mode) {
   } catch (e) {}
 }
 
-function sliderChanged(value) {
-  document.getElementById('dutyValue').textContent = value + ' %';
+async function setRememberMode(enabled) {
+  const checkbox = document.getElementById('rememberMode');
 
-  clearTimeout(sliderTimer);
+  try {
+    const response = await fetch(
+      '/api/preferences?remember=' + (enabled ? 'true' : 'false'),
+      {method: 'POST', cache: 'no-store'}
+    );
 
-  sliderTimer = setTimeout(async () => {
-    try {
-      await fetch('/api/duty?value=' + encodeURIComponent(value), {
-        method: 'POST',
-        cache: 'no-store'
-      });
-      await getStatus();
-    } catch (e) {}
-  }, 40);
+    if (!response.ok) throw new Error('Preference update failed');
+
+    await getStatus();
+  } catch (e) {
+    // Restore the actual state from the ESP32.
+    await getStatus();
+  }
 }
 
 async function emergencyShutdown() {
@@ -1146,8 +941,7 @@ setInterval(heartbeat, 5000);
 // ============================================================
 // LOCAL HTTP API
 // ============================================================
-// The local web UI has been removed to reduce flash usage.
-// The HTTP API remains available for local diagnostics/control.
+// The local web UI and HTTP API are available for local control.
 // ============================================================
 // WEB SERVER HANDLERS
 // ============================================================
@@ -1178,8 +972,6 @@ void handleMode() {
     setMode(MODE_AUTO);
   } else if (mode == "OPEN") {
     setMode(MODE_OPEN);
-  } else if (mode == "MANUAL") {
-    setMode(MODE_MANUAL);
   } else {
     server.send(400, "text/plain", "Invalid mode");
     return;
@@ -1187,33 +979,42 @@ void handleMode() {
 
   lastHeartbeat = millis();
   server.send(200, "application/json", makeStatusJson());
-  bleNotifyStatus();
 }
 
-void handleDuty() {
+void handlePreferences() {
   if (emergencyShutdown) {
     server.send(503, "text/plain", "Emergency shutdown active");
     return;
   }
 
-  if (!server.hasArg("value")) {
-    server.send(400, "text/plain", "Missing value");
+  if (!server.hasArg("remember")) {
+    server.send(400, "text/plain", "Missing remember");
     return;
   }
 
-  int value = server.arg("value").toInt();
+  String value = server.arg("remember");
+  value.toLowerCase();
 
-  if (value < 0) value = 0;
-  if (value > 100) value = 100;
+  bool enabled =
+    (value == "true" || value == "1" || value == "on");
 
-  manualDutyPercent = (uint8_t)value;
+  if (enabled == rememberLastMode) {
+    server.send(200, "application/json", makeStatusJson());
+      return;
+  }
 
-  // A duty update also switches to MANUAL.
-  setMode(MODE_MANUAL);
+  rememberLastMode = enabled;
 
-  lastHeartbeat = millis();
+  if (enabled) {
+    if (currentMode == MODE_AUTO || currentMode == MODE_OPEN) {
+      rememberedMode = currentMode;
+    }
+    saveModePreference(true, rememberedMode);
+  } else {
+    saveModePreference(false, rememberedMode);
+  }
+
   server.send(200, "application/json", makeStatusJson());
-  bleNotifyStatus();
 }
 
 void handleEmergency() {
@@ -1273,8 +1074,6 @@ void setup() {
   digitalWrite(STATUS_LED_PIN, LED_OFF);
 
   currentMode = MODE_AUTO;
-  manualDutyPercent = 0;
-
   setupPwm();
   applyOutputs();
 
@@ -1288,6 +1087,9 @@ void setup() {
     emergencyShutdown = false;
   }
 
+  // Load the optional remembered AUTO/OPEN startup mode.
+  loadModePreference();
+
   emergencyShutdownRequested = false;
 
   // If emergency was stored in NVS, stay completely offline.
@@ -1296,7 +1098,7 @@ void setup() {
     pwmOff();
     digitalWrite(STATUS_LED_PIN, LED_OFF);
 
-    // Do NOT start Wi-Fi, BLE or HTTP server.
+    // Do NOT start Wi-Fi or HTTP server.
     // The physical GPIO0 button is the only reset path.
     emergencyResetButtonArmed = false;
     lastEmergencyResetButtonState =
@@ -1310,7 +1112,6 @@ void setup() {
     SERIAL_PRINTLN("Relay: OFF");
     SERIAL_PRINTLN("PWM:   OFF");
     SERIAL_PRINTLN("WiFi:  OFF");
-    SERIAL_PRINTLN("BLE:   OFF");
     SERIAL_PRINTLN("Release GPIO0 first, then press it");
     SERIAL_PRINTLN("to clear emergency.");
     SERIAL_PRINTLN("==================================");
@@ -1322,13 +1123,21 @@ void setup() {
   // Normal startup.
   // ----------------------------------------------------------
 
+  if (rememberLastMode) {
+    currentMode = rememberedMode;
+  } else {
+    currentMode = MODE_AUTO;
+  }
+
+  applyOutputs();
   startCommunicationServices();
 
   SERIAL_PRINTLN();
   SERIAL_PRINTLN("==================================");
   SERIAL_PRINTLN("ESP32 Exhaust Controller");
   SERIAL_PRINTLN("==================================");
-  SERIAL_PRINTLN("Mode: AUTO");
+  SERIAL_PRINT("Mode: ");
+  SERIAL_PRINTLN(currentMode == MODE_OPEN ? "OPEN" : "AUTO");
   SERIAL_PRINTLN("==================================");
 }
 
@@ -1352,13 +1161,15 @@ void loop() {
       pwmOff();
       digitalWrite(STATUS_LED_PIN, LED_OFF);
 
-      delay(10);
+      // Conservative emergency loop timing: outputs remain safely OFF while
+      // avoiding unnecessary CPU spinning during the offline state.
+      delay(20);
       return;
     }
   }
 
   // ----------------------------------------------------------
-  // Emergency shutdown request may originate from Wi-Fi or BLE.
+  // Emergency shutdown request from the Wi-Fi web UI.
   // ----------------------------------------------------------
 
   if (emergencyShutdownRequested && !emergencyShutdown) {
@@ -1375,19 +1186,6 @@ void loop() {
   }
 
   // ----------------------------------------------------------
-  // BLE status notifications.
-  // ----------------------------------------------------------
-
-  if (communicationServicesStarted &&
-      BLE_ENABLED &&
-      bleClientConnected &&
-      (millis() - lastBleStatus >= BLE_STATUS_INTERVAL_MS)) {
-
-    lastBleStatus = millis();
-    bleNotifyStatus();
-  }
-
-  // ----------------------------------------------------------
   // Optional communication failsafe.
   // ----------------------------------------------------------
 
@@ -1401,8 +1199,9 @@ void loop() {
     setMode(MODE_AUTO);
     lastHeartbeat = millis();
 
-    bleNotifyStatus();
-  }
+    }
 
-  delay(1);
+  // 5 ms keeps the controller responsive while reducing needless CPU load
+  // compared with a 1 ms busy loop.
+  delay(5);
 }
