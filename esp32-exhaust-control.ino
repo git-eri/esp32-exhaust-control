@@ -32,9 +32,10 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <nvs.h>
 
 // Set to true for serial debug output, false for completely silent UART.
-#define SERIAL_OUTPUT_ENABLED   false
+#define SERIAL_OUTPUT_ENABLED   true
 
 #if SERIAL_OUTPUT_ENABLED
   #define SERIAL_LOG_BEGIN(baud) Serial.begin(baud)
@@ -122,6 +123,8 @@ WebServer server(80);
 Preferences preferences;
 
 bool communicationServicesStarted = false;
+bool pwmReady = false;
+bool persistenceOk = true;
 
 bool emergencyResetButtonArmed = false;
 bool lastEmergencyResetButtonState = HIGH;
@@ -140,8 +143,8 @@ unsigned long lastHeartbeat = 0;
 
 bool emergencyShutdown = false;
 
-// HTTP emergency request is handled in loop() after the HTTP response.
-volatile bool emergencyShutdownRequested = false;
+// Outputs are disabled before the HTTP reply; Wi-Fi stops afterwards in loop().
+bool communicationShutdownRequested = false;
 
 // LEDC channel is only needed with Arduino-ESP32 2.x.
 #if defined(ESP_ARDUINO_VERSION_MAJOR)
@@ -160,27 +163,51 @@ volatile bool emergencyShutdownRequested = false;
 // PERSISTENT EMERGENCY STATE
 // ============================================================
 
-void saveEmergencyState(bool active) {
+bool saveEmergencyState(bool active) {
   if (!preferences.begin(NVS_NAMESPACE, false)) {
     SERIAL_PRINTLN("NVS: ERROR opening namespace for write");
-    return;
-  }
-
-  preferences.putBool(NVS_EMERGENCY_KEY, active);
-  preferences.end();
-
-  SERIAL_PRINT("NVS: emergency = ");
-  SERIAL_PRINTLN(active ? "true" : "false");
-}
-
-bool loadEmergencyState() {
-  if (!preferences.begin(NVS_NAMESPACE, true)) {
-    SERIAL_PRINTLN("NVS: ERROR opening namespace for read");
+    persistenceOk = false;
     return false;
   }
 
-  bool active = preferences.getBool(NVS_EMERGENCY_KEY, false);
+  const bool saved = (preferences.putBool(NVS_EMERGENCY_KEY, active) == 1);
   preferences.end();
+  persistenceOk = saved;
+
+  if (!saved) {
+    SERIAL_PRINTLN("NVS: ERROR saving emergency state");
+    return false;
+  }
+
+  SERIAL_PRINT("NVS: emergency = ");
+  SERIAL_PRINTLN(active ? "true" : "false");
+  return true;
+}
+
+// Unlike Preferences getters, this preserves the reason for a failed read.
+// Missing keys/namespaces are normal on the first boot; other errors are not.
+esp_err_t readStoredByte(const char* key, uint8_t& value) {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+  if (err != ESP_OK) return err;
+
+  err = nvs_get_u8(handle, key, &value);
+  nvs_close(handle);
+  return err;
+}
+
+bool loadEmergencyState() {
+  uint8_t storedState = 0;
+  const esp_err_t err = readStoredByte(NVS_EMERGENCY_KEY, storedState);
+
+  if (err == ESP_ERR_NVS_NOT_FOUND) return false;
+  if (err != ESP_OK || storedState > 1) {
+    SERIAL_PRINTLN("NVS: ERROR reading emergency state -> stay offline");
+    persistenceOk = false;
+    return true;
+  }
+
+  const bool active = (storedState == 1);
 
   SERIAL_PRINT("NVS: emergency = ");
   SERIAL_PRINTLN(active ? "true" : "false");
@@ -192,45 +219,60 @@ bool loadEmergencyState() {
 // PERSISTENT START MODE
 // ============================================================
 
-void saveModePreference(bool remember, ControlMode mode) {
-  if (!preferences.begin(NVS_NAMESPACE, false)) {
-    SERIAL_PRINTLN("NVS: ERROR opening namespace for mode preference");
-    return;
+bool saveModePreference(bool remember, ControlMode mode) {
+  if (mode != MODE_AUTO && mode != MODE_OPEN) {
+    persistenceOk = false;
+    return false;
   }
 
-  preferences.putBool(NVS_REMEMBER_MODE_KEY, remember);
+  if (!preferences.begin(NVS_NAMESPACE, false)) {
+    SERIAL_PRINTLN("NVS: ERROR opening namespace for mode preference");
+    persistenceOk = false;
+    return false;
+  }
 
-  if (remember && (mode == MODE_AUTO || mode == MODE_OPEN)) {
-    preferences.putUChar(NVS_START_MODE_KEY, static_cast<uint8_t>(mode));
+  // Store the selected mode before enabling it, so a failed mode write cannot
+  // accidentally enable a stale startup mode.
+  bool saved = true;
+  if (remember) {
+    saved = (preferences.putUChar(NVS_START_MODE_KEY,
+                                 static_cast<uint8_t>(mode)) == 1);
+  }
+  if (saved) {
+    saved = (preferences.putBool(NVS_REMEMBER_MODE_KEY, remember) == 1);
   }
 
   preferences.end();
+  persistenceOk = saved;
+
+  if (!saved) {
+    SERIAL_PRINTLN("NVS: ERROR saving mode preference");
+    return false;
+  }
 
   SERIAL_PRINT("NVS: remember mode = ");
   SERIAL_PRINTLN(remember ? "true" : "false");
+  return true;
 }
 
 void loadModePreference() {
-  if (!preferences.begin(NVS_NAMESPACE, true)) {
-    SERIAL_PRINTLN("NVS: ERROR opening namespace for mode preference read");
-    rememberLastMode = false;
-    rememberedMode = MODE_AUTO;
+  rememberLastMode = false;
+  rememberedMode = MODE_AUTO;
+  uint8_t storedRemember = 0;
+  uint8_t storedMode = static_cast<uint8_t>(MODE_AUTO);
+  const esp_err_t rememberErr = readStoredByte(NVS_REMEMBER_MODE_KEY, storedRemember);
+  const esp_err_t modeErr = readStoredByte(NVS_START_MODE_KEY, storedMode);
+
+  if ((rememberErr != ESP_OK && rememberErr != ESP_ERR_NVS_NOT_FOUND) ||
+      (modeErr != ESP_OK && modeErr != ESP_ERR_NVS_NOT_FOUND) ||
+      storedRemember > 1 || storedMode > static_cast<uint8_t>(MODE_OPEN)) {
+    SERIAL_PRINTLN("NVS: ERROR reading mode preference -> AUTO");
+    persistenceOk = false;
     return;
   }
 
-  rememberLastMode = preferences.getBool(NVS_REMEMBER_MODE_KEY, false);
-
-  uint8_t storedMode =
-    preferences.getUChar(NVS_START_MODE_KEY, static_cast<uint8_t>(MODE_AUTO));
-
-  preferences.end();
-
-  if (storedMode == static_cast<uint8_t>(MODE_OPEN)) {
-    rememberedMode = MODE_OPEN;
-  } else {
-    rememberedMode = MODE_AUTO;
-  }
-
+  rememberLastMode = (storedRemember == 1);
+  rememberedMode = static_cast<ControlMode>(storedMode);
   SERIAL_PRINT("NVS: remember mode = ");
   SERIAL_PRINTLN(rememberLastMode ? "true" : "false");
 
@@ -370,11 +412,20 @@ void stopCommunicationServices() {
 void clearEmergencyAndRestart() {
   SERIAL_PRINTLN("Physical emergency reset accepted");
 
-  // Clear persistent emergency state first.
-  saveEmergencyState(false);
+  // Require a new release/press even if clearing NVS fails. A held button
+  // must not cause repeated flash writes on every loop iteration.
+  emergencyResetButtonArmed = false;
+  lastEmergencyResetButtonState = digitalRead(EMERGENCY_RESET_PIN);
+  lastEmergencyResetButtonChangedAt = millis();
+
+  // Keep the lock active if its persistent state could not be cleared.
+  if (!saveEmergencyState(false)) {
+    SERIAL_PRINTLN("Emergency reset failed -> stay offline");
+    return;
+  }
 
   emergencyShutdown = false;
-  emergencyShutdownRequested = false;
+  communicationShutdownRequested = false;
 
   currentMode = MODE_AUTO;
 
@@ -382,11 +433,6 @@ void clearEmergencyAndRestart() {
   setRelay(false);
   pwmOff();
   digitalWrite(STATUS_LED_PIN, LED_OFF);
-
-  // Keep the button logic disarmed until the current press is released.
-  emergencyResetButtonArmed = false;
-  lastEmergencyResetButtonState = digitalRead(EMERGENCY_RESET_PIN);
-  lastEmergencyResetButtonChangedAt = millis();
 
   startCommunicationServices();
 
@@ -437,15 +483,38 @@ void handleEmergencyResetButton() {
 // ============================================================
 
 
-void pwmOff() {
+void markPwmUnavailable() {
+  pwmReady = false;
 #ifdef USE_LEDC_OLD_API
-  ledcWrite(PWM_CHANNEL, 0);
+  ledcDetachPin(PWM_PIN);
 #else
-  ledcWrite(PWM_PIN, 0);
+  ledcDetach(PWM_PIN);
 #endif
+  pinMode(PWM_PIN, OUTPUT);
+  digitalWrite(PWM_PIN, LOW);
+  SERIAL_PRINTLN("PWM: ERROR -> OPEN unavailable");
 }
 
-void pwmWritePercent(uint8_t percent) {
+bool pwmOff() {
+  if (!pwmReady) {
+    digitalWrite(PWM_PIN, LOW);
+    return false;
+  }
+
+#ifdef USE_LEDC_OLD_API
+  // Arduino-ESP32 2.x has no return value for writes or pin attachment.
+  ledcWrite(PWM_CHANNEL, 0);
+#else
+  if (!ledcWrite(PWM_PIN, 0)) {
+    markPwmUnavailable();
+    return false;
+  }
+#endif
+  return true;
+}
+
+bool pwmWritePercent(uint8_t percent) {
+  if (!pwmReady) return false;
   if (percent > 100) percent = 100;
   
   uint8_t invertedPercent = 100 - percent;
@@ -457,18 +526,31 @@ void pwmWritePercent(uint8_t percent) {
 #ifdef USE_LEDC_OLD_API
   ledcWrite(PWM_CHANNEL, duty);
 #else
-  ledcWrite(PWM_PIN, duty);
+  if (!ledcWrite(PWM_PIN, duty)) {
+    markPwmUnavailable();
+    return false;
+  }
 #endif
+  return true;
 }
 
 void setupPwm() {
+  pinMode(PWM_PIN, OUTPUT);
+  digitalWrite(PWM_PIN, LOW);
+
 #ifdef USE_LEDC_OLD_API
-  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY_HZ, PWM_RESOLUTION_BITS);
-  ledcAttachPin(PWM_PIN, PWM_CHANNEL);
+  pwmReady = (ledcSetup(PWM_CHANNEL, PWM_FREQUENCY_HZ, PWM_RESOLUTION_BITS) > 0);
+  if (pwmReady) {
+    ledcAttachPin(PWM_PIN, PWM_CHANNEL);
+  }
 #else
-  ledcAttach(PWM_PIN, PWM_FREQUENCY_HZ, PWM_RESOLUTION_BITS);
+  pwmReady = ledcAttach(PWM_PIN, PWM_FREQUENCY_HZ, PWM_RESOLUTION_BITS);
 #endif
 
+  if (!pwmReady) {
+    markPwmUnavailable();
+    return;
+  }
   pwmOff();
 }
 
@@ -481,7 +563,8 @@ void setRelay(bool on) {
 }
 
 void applyOutputs() {
-  if (emergencyShutdown) {
+  if (emergencyShutdown || !pwmReady) {
+    currentMode = MODE_AUTO;
     setRelay(false);
     pwmOff();
     digitalWrite(STATUS_LED_PIN, LED_OFF);
@@ -497,8 +580,15 @@ void applyOutputs() {
       break;
 
     case MODE_OPEN:
+      // Only connect the override signal after LEDC accepted the PWM write.
+      if (!pwmWritePercent(OPEN_PWM_DUTY_PERCENT)) {
+        currentMode = MODE_AUTO;
+        setRelay(false);
+        pwmOff();
+        digitalWrite(STATUS_LED_PIN, LED_OFF);
+        break;
+      }
       setRelay(true);
-      pwmWritePercent(OPEN_PWM_DUTY_PERCENT);
       digitalWrite(STATUS_LED_PIN, LED_ON);
       break;
   }
@@ -512,21 +602,24 @@ const char* modeToString() {
   return "AUTO";
 }
 
-void setMode(ControlMode mode) {
-  if (emergencyShutdown) return;
+bool setMode(ControlMode mode) {
+  if (emergencyShutdown) return false;
 
   if (mode != MODE_AUTO && mode != MODE_OPEN) {
-    return;
+    return false;
   }
 
   currentMode = mode;
+  // Respond to the requested mode before any potentially slow flash writes.
+  applyOutputs();
+  if (currentMode != mode) return false;
 
-  if (rememberLastMode && rememberedMode != mode) {
+  if (rememberLastMode && (rememberedMode != mode || !persistenceOk)) {
+    if (!saveModePreference(true, mode)) return false;
     rememberedMode = mode;
-    saveModePreference(true, rememberedMode);
   }
 
-  applyOutputs();
+  return true;
 }
 
 // ============================================================
@@ -561,6 +654,12 @@ String makeStatusJson() {
   json += ",";
   json += "\"rememberMode\":";
   json += (rememberLastMode ? "true" : "false");
+  json += ",";
+  json += "\"pwmReady\":";
+  json += (pwmReady ? "true" : "false");
+  json += ",";
+  json += "\"persistenceOk\":";
+  json += (persistenceOk ? "true" : "false");
   json += "}";
 
   return json;
@@ -574,7 +673,7 @@ void emergencyShutdownNow() {
   if (emergencyShutdown) return;
 
   emergencyShutdown = true;
-  emergencyShutdownRequested = false;
+  currentMode = MODE_AUTO;
 
   // SAFE OUTPUTS FIRST.
   setRelay(false);
@@ -592,8 +691,8 @@ void emergencyShutdownNow() {
   SERIAL_PRINTLN("Hold physical GPIO0 button for 5 seconds to reset.");
   SERIAL_PRINTLN("==================================");
 
-  // Stop communication after the outputs are safe.
-  stopCommunicationServices();
+  // The HTTP handler reports the output and storage result before loop()
+  // stops communication. Loss of Wi-Fi alone is not a shutdown confirmation.
 }
 
 // ============================================================
@@ -674,7 +773,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    background: var(--ok);
+    background: var(--muted);
   }
 
   .transport {
@@ -735,6 +834,26 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     color: white;
   }
 
+  button:disabled, input:disabled {
+    opacity: 0.45;
+  }
+
+  .message {
+    margin-top: 10px;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.45;
+    text-align: center;
+  }
+
+  .message.error {
+    color: var(--danger);
+  }
+
+  .stats.stale .stat-value {
+    opacity: 0.45;
+  }
+
   .stats {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -774,19 +893,19 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="subtitle">ESP32 Controller</div>
 
   <div class="card">
-    <button class="emergency" onclick="emergencyShutdown()">⚠ NOT AUS</button>
+    <button id="btnEmergency" class="emergency" onclick="emergencyShutdown()">⚠ NOT AUS</button>
   </div>
 
   <div class="card">
     <div class="modes">
-      <button id="btnAuto" onclick="setMode('AUTO')">AUTO</button>
-      <button id="btnOpen" onclick="setMode('OPEN')">OFFEN</button>
+      <button id="btnAuto" onclick="setMode('AUTO')" disabled>AUTO</button>
+      <button id="btnOpen" onclick="setMode('OPEN')" disabled>OFFEN</button>
     </div>
   </div>
 
   <div class="card">
     <label style="display:flex;align-items:center;gap:12px;cursor:pointer;">
-      <input id="rememberMode" type="checkbox"
+      <input id="rememberMode" type="checkbox" disabled
              onchange="setRememberMode(this.checked)"
              style="width:22px;height:22px;accent-color:var(--accent);">
       <span>
@@ -798,31 +917,33 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="card">
     <div class="connection">
       <span id="connectionDot" class="dot"></span>
-      <span id="connectionText">Verbunden</span>
+      <span id="connectionText">Verbinde …</span>
     </div>
-    <div id="transportText" class="transport">Lokales WLAN</div>
+    <div id="transportText" class="transport">Warte auf Status</div>
+    <div id="commandMessage" class="message" role="status" aria-live="polite" hidden></div>
+    <div id="deviceWarning" class="message error" role="status" aria-live="polite" hidden></div>
   </div>
 
   <div class="card">
-    <div class="stats">
+    <div id="statusStats" class="stats stale">
       <div class="stat">
         <div class="stat-label">MODUS</div>
-        <div id="modeValue" class="stat-value">AUTO</div>
+        <div id="modeValue" class="stat-value">—</div>
       </div>
 
       <div class="stat">
         <div class="stat-label">PWM</div>
-        <div id="pwmValue" class="stat-value">0 %</div>
+        <div id="pwmValue" class="stat-value">—</div>
       </div>
 
       <div class="stat">
         <div class="stat-label">RELAIS</div>
-        <div id="relayValue" class="stat-value">AUS</div>
+        <div id="relayValue" class="stat-value">—</div>
       </div>
 
       <div class="stat">
         <div class="stat-label">FREQUENZ</div>
-        <div id="frequencyValue" class="stat-value">100 Hz</div>
+        <div id="frequencyValue" class="stat-value">—</div>
       </div>
     </div>
   </div>
@@ -830,10 +951,79 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </div>
 
 <script>
-let currentMode = 'AUTO';
+const REQUEST_TIMEOUT_MS = 4000;
+const activeRequests = new Set();
+let latestStatus = null;
+let connected = false;
+let commandBusy = false;
+let emergencyPending = false;
+let emergencyViewActive = false;
+let pollingActive = false;
+let statusTimer = null;
+let heartbeatTimer = null;
+let requestGeneration = 0;
+let statusRevision = 0;
+
+async function request(url, method = 'GET', expectJson = true) {
+  const controller = new AbortController();
+  activeRequests.add(controller);
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method,
+      cache: 'no-store',
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const error = new Error('ESP32 hat den Befehl abgelehnt.');
+      error.httpStatus = response.status;
+      throw error;
+    }
+
+    return expectJson ? await response.json() : await response.text();
+  } finally {
+    clearTimeout(timeout);
+    activeRequests.delete(controller);
+  }
+}
+
+function showCommandMessage(message, isError = true) {
+  if (emergencyViewActive) return;
+  const element = document.getElementById('commandMessage');
+  element.textContent = message;
+  element.hidden = !message;
+  element.classList.toggle('error', isError);
+}
+
+function updateControls() {
+  if (emergencyViewActive) return;
+  const disabled = commandBusy || emergencyPending || !connected;
+  document.getElementById('btnAuto').disabled = disabled;
+  document.getElementById('btnOpen').disabled =
+    disabled || (latestStatus && latestStatus.pwmReady === false);
+  document.getElementById('rememberMode').disabled = disabled;
+  document.getElementById('btnEmergency').disabled = emergencyPending;
+}
+
+function setConnection(isConnected) {
+  if (emergencyViewActive) return;
+  connected = isConnected;
+  document.getElementById('connectionText').textContent =
+    connected ? 'Verbunden' : 'Verbindung verloren';
+  document.getElementById('connectionDot').style.background =
+    connected ? 'var(--ok)' : 'var(--danger)';
+  document.getElementById('transportText').textContent = connected
+    ? 'Lokales WLAN'
+    : (latestStatus ? 'Angezeigte Werte sind nicht mehr aktuell' : 'Status nicht verfügbar');
+  document.getElementById('statusStats').classList.toggle('stale', !connected);
+  updateControls();
+}
 
 function updateUI(data) {
-  currentMode = data.mode;
+  if (emergencyPending || emergencyViewActive) return;
+  latestStatus = data;
 
   document.getElementById('modeValue').textContent = data.mode;
   document.getElementById('pwmValue').textContent = data.duty + ' %';
@@ -844,94 +1034,160 @@ function updateUI(data) {
   document.getElementById('btnOpen').classList.toggle('active', data.mode === 'OPEN');
   document.getElementById('rememberMode').checked = !!data.rememberMode;
 
-  document.getElementById('connectionText').textContent = 'Verbunden';
-  document.getElementById('transportText').textContent = 'Lokales WLAN';
+  const warnings = [];
+  if (data.pwmReady === false) warnings.push('PWM nicht verfügbar. OFFEN ist gesperrt.');
+  if (data.persistenceOk === false) {
+    warnings.push('Dauerhafte Einstellungen konnten nicht gelesen oder gespeichert werden.');
+  }
+  const warning = document.getElementById('deviceWarning');
+  warning.textContent = warnings.join(' ');
+  warning.hidden = warnings.length === 0;
+  setConnection(true);
 }
 
 async function getStatus() {
+  if (commandBusy || emergencyPending || emergencyViewActive) return;
+  const generation = requestGeneration;
+  const revision = statusRevision;
+
   try {
-    const response = await fetch('/api/status', {cache: 'no-store'});
-    const data = await response.json();
+    const data = await request('/api/status');
+    if (generation === requestGeneration && revision === statusRevision) updateUI(data);
+  } catch (e) {
+    if (generation === requestGeneration && revision === statusRevision) setConnection(false);
+  }
+}
+
+async function sendCommand(url, failureMessage) {
+  if (commandBusy || emergencyPending || emergencyViewActive) return;
+  const generation = requestGeneration;
+  commandBusy = true;
+  ++statusRevision;
+  showCommandMessage('', false);
+  updateControls();
+
+  try {
+    const data = await request(url, 'POST');
+    if (generation !== requestGeneration) return;
+    commandBusy = false;
     updateUI(data);
   } catch (e) {
-    document.getElementById('connectionText').textContent = 'Verbindung verloren';
-    document.getElementById('transportText').textContent = '';
+    if (generation !== requestGeneration) return;
+    commandBusy = false;
+    showCommandMessage(failureMessage);
+    if (latestStatus) {
+      document.getElementById('rememberMode').checked = !!latestStatus.rememberMode;
+    }
+    await getStatus();
+  } finally {
+    if (generation === requestGeneration) {
+      commandBusy = false;
+      updateControls();
+    }
   }
 }
 
 async function setMode(mode) {
-  try {
-    await fetch('/api/mode?mode=' + encodeURIComponent(mode), {
-      method: 'POST',
-      cache: 'no-store'
-    });
-    await getStatus();
-  } catch (e) {}
+  await sendCommand('/api/mode?mode=' + encodeURIComponent(mode),
+    'Modusänderung nicht bestätigt. Bitte den angezeigten Zustand prüfen.');
 }
 
 async function setRememberMode(enabled) {
-  const checkbox = document.getElementById('rememberMode');
+  await sendCommand('/api/preferences?remember=' + (enabled ? 'true' : 'false'),
+    'Speichern nicht bestätigt. Bitte den angezeigten Zustand prüfen.');
+}
 
-  try {
-    const response = await fetch(
-      '/api/preferences?remember=' + (enabled ? 'true' : 'false'),
-      {method: 'POST', cache: 'no-store'}
-    );
-
-    if (!response.ok) throw new Error('Preference update failed');
-
-    await getStatus();
-  } catch (e) {
-    // Restore the actual state from the ESP32.
-    await getStatus();
-  }
+function stopPolling() {
+  pollingActive = false;
+  ++requestGeneration;
+  clearTimeout(statusTimer);
+  clearTimeout(heartbeatTimer);
+  statusTimer = null;
+  heartbeatTimer = null;
+  for (const controller of activeRequests) controller.abort();
 }
 
 async function emergencyShutdown() {
-  try {
-    await fetch('/api/emergency', {
-      method: 'POST',
-      cache: 'no-store'
-    });
-  } catch (e) {
-    // Expected: ESP32 disables Wi-Fi immediately.
-  }
+  if (emergencyPending || emergencyViewActive) return;
+  emergencyPending = true;
+  stopPolling();
+  updateControls();
+  showCommandMessage('Abschaltung wird angefordert …', false);
 
-  document.body.innerHTML = `
-    <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;
-                text-align:center;padding:25px;font-family:Arial,sans-serif;
-                background:#0f1115;color:#fff;">
-      <div>
-        <div style="font-size:64px">⚠</div>
-        <h1>EMERGENCY OFF</h1>
-        <p style="color:#9ba3b2">Relais AUS<br>PWM AUS<br>WLAN AUS</p>
-        <p style="color:#9ba3b2;font-size:13px">
-          ESP32 bleibt stromversorgt.<br>
-          Zum Zurücksetzen den physischen Taster an GPIO0 drücken.
-        </p>
-        <button onclick="location.reload()"
-                style="margin-top:18px;width:100%;min-height:58px;padding:12px 18px;
-                       border:1px solid #303643;border-radius:14px;background:#222631;
-                       color:#fff;font-size:17px;font-weight:700;cursor:pointer;
-                       touch-action:manipulation;">
-          🔄 Aktualisieren
-        </button>
-      </div>
-    </div>`;
+  try {
+    const data = await request('/api/emergency', 'POST');
+    if (data.emergency !== true) throw new Error('Abschaltung nicht bestätigt');
+
+    emergencyViewActive = true;
+    stopPolling();
+    const persistenceWarning = data.persistenceOk === false
+      ? '<p style="color:#ff6262;font-size:13px">Abschaltung aktiv, aber Speicherung fehlgeschlagen.<br>Nach einem Stromausfall ist die Abschaltung möglicherweise nicht mehr aktiv.</p>'
+      : '';
+
+    document.body.innerHTML = `
+      <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;
+                  text-align:center;padding:25px;font-family:Arial,sans-serif;
+                  background:#0f1115;color:#fff;">
+        <div>
+          <div style="font-size:64px">⚠</div>
+          <h1>EMERGENCY OFF</h1>
+          <p style="color:#9ba3b2">Abschaltung bestätigt<br>Relais AUS<br>PWM AUS<br>WLAN wird abgeschaltet</p>
+          ${persistenceWarning}
+          <p style="color:#9ba3b2;font-size:13px">
+            ESP32 bleibt stromversorgt.<br>
+            Zum Zurücksetzen den GPIO0-Taster zuerst loslassen,<br>
+            dann 5 Sekunden gedrückt halten.
+          </p>
+          <button onclick="location.reload()"
+                  style="margin-top:18px;width:100%;min-height:58px;padding:12px 18px;
+                         border:1px solid #303643;border-radius:14px;background:#222631;
+                         color:#fff;font-size:17px;font-weight:700;cursor:pointer;
+                         touch-action:manipulation;">
+            🔄 Aktualisieren
+          </button>
+        </div>
+      </div>`;
+  } catch (e) {
+    emergencyPending = false;
+    commandBusy = false;
+    showCommandMessage('Abschaltung nicht bestätigt. Erneut versuchen oder den Zustand am Gerät prüfen.');
+    setConnection(false);
+    startPolling();
+  }
 }
 
 async function heartbeat() {
   try {
-    await fetch('/api/heartbeat', {
-      method: 'POST',
-      cache: 'no-store'
-    });
-  } catch (e) {}
+    await request('/api/heartbeat', 'POST', false);
+  } catch (e) {
+    // Status polling provides connection feedback without hiding command errors.
+  }
 }
 
-getStatus();
-setInterval(getStatus, 1000);
-setInterval(heartbeat, 5000);
+async function pollStatus() {
+  const generation = requestGeneration;
+  await getStatus();
+  if (pollingActive && generation === requestGeneration) {
+    statusTimer = setTimeout(pollStatus, 1000);
+  }
+}
+
+async function pollHeartbeat() {
+  const generation = requestGeneration;
+  await heartbeat();
+  if (pollingActive && generation === requestGeneration) {
+    heartbeatTimer = setTimeout(pollHeartbeat, 5000);
+  }
+}
+
+function startPolling() {
+  if (pollingActive || emergencyPending || emergencyViewActive) return;
+  pollingActive = true;
+  pollStatus();
+  heartbeatTimer = setTimeout(pollHeartbeat, 5000);
+}
+
+startPolling();
 </script>
 
 </body>
@@ -968,16 +1224,27 @@ void handleMode() {
   String mode = server.arg("mode");
   mode.toUpperCase();
 
+  ControlMode requestedMode;
   if (mode == "AUTO") {
-    setMode(MODE_AUTO);
+    requestedMode = MODE_AUTO;
   } else if (mode == "OPEN") {
-    setMode(MODE_OPEN);
+    requestedMode = MODE_OPEN;
   } else {
     server.send(400, "text/plain", "Invalid mode");
     return;
   }
 
   lastHeartbeat = millis();
+  if (!setMode(requestedMode)) {
+    if (requestedMode == MODE_OPEN && currentMode != MODE_OPEN) {
+      server.send(503, "text/plain; charset=utf-8",
+                  "PWM nicht verfügbar. AUTO bleibt aktiv.");
+    } else {
+      server.send(500, "text/plain; charset=utf-8",
+                  "Modus angewendet, aber die Starteinstellung konnte nicht gespeichert werden.");
+    }
+    return;
+  }
   server.send(200, "application/json", makeStatusJson());
 }
 
@@ -995,24 +1262,30 @@ void handlePreferences() {
   String value = server.arg("remember");
   value.toLowerCase();
 
-  bool enabled =
-    (value == "true" || value == "1" || value == "on");
-
-  if (enabled == rememberLastMode) {
-    server.send(200, "application/json", makeStatusJson());
-      return;
-  }
-
-  rememberLastMode = enabled;
-
-  if (enabled) {
-    if (currentMode == MODE_AUTO || currentMode == MODE_OPEN) {
-      rememberedMode = currentMode;
-    }
-    saveModePreference(true, rememberedMode);
+  bool enabled;
+  if (value == "true" || value == "1" || value == "on") {
+    enabled = true;
+  } else if (value == "false" || value == "0" || value == "off") {
+    enabled = false;
   } else {
-    saveModePreference(false, rememberedMode);
+    server.send(400, "text/plain", "Invalid remember value");
+    return;
   }
+
+  if (enabled == rememberLastMode && persistenceOk) {
+    server.send(200, "application/json", makeStatusJson());
+    return;
+  }
+
+  if (!saveModePreference(enabled, currentMode)) {
+    server.send(500, "text/plain; charset=utf-8",
+                "Die Starteinstellung konnte nicht gespeichert werden.");
+    return;
+  }
+
+  // Reflect only successfully stored preferences in the UI.
+  rememberLastMode = enabled;
+  if (enabled) rememberedMode = currentMode;
 
   server.send(200, "application/json", makeStatusJson());
 }
@@ -1023,9 +1296,14 @@ void handleEmergency() {
     return;
   }
 
-  // Respond before communication is disabled.
-  server.send(200, "application/json", "{\"emergency\":true}");
-  emergencyShutdownRequested = true;
+  // Disable outputs and check persistence before confirming the shutdown.
+  // Keep HTTP alive just long enough to send this result; loop() stops Wi-Fi.
+  emergencyShutdownNow();
+  String response = "{\"emergency\":true,\"persistenceOk\":";
+  response += (persistenceOk ? "true" : "false");
+  response += "}";
+  server.send(200, "application/json", response);
+  communicationShutdownRequested = true;
 }
 
 void handleHeartbeat() {
@@ -1090,7 +1368,7 @@ void setup() {
   // Load the optional remembered AUTO/OPEN startup mode.
   loadModePreference();
 
-  emergencyShutdownRequested = false;
+  communicationShutdownRequested = false;
 
   // If emergency was stored in NVS, stay completely offline.
   if (emergencyShutdown) {
@@ -1147,6 +1425,13 @@ void setup() {
 // ============================================================
 
 void loop() {
+  // Finish an acknowledged HTTP shutdown before accepting another command.
+  if (communicationShutdownRequested) {
+    communicationShutdownRequested = false;
+    stopCommunicationServices();
+    return;
+  }
+
   // ----------------------------------------------------------
   // Physical emergency reset button.
   // This must also run while communications are OFF.
@@ -1166,15 +1451,6 @@ void loop() {
       delay(20);
       return;
     }
-  }
-
-  // ----------------------------------------------------------
-  // Emergency shutdown request from the Wi-Fi web UI.
-  // ----------------------------------------------------------
-
-  if (emergencyShutdownRequested && !emergencyShutdown) {
-    emergencyShutdownNow();
-    return;
   }
 
   // ----------------------------------------------------------

@@ -1,108 +1,100 @@
 # ESP32 Exhaust Controller
 
+ESP32 firmware for a relay board that switches a BMW exhaust valve between the original vehicle controller and a local PWM signal. Control is available through an embedded web page over the ESP32's Wi-Fi access point. No internet connection or external web server is required.
+
 ## Hardware
 
-Target: ESP32-WROOM-32E
+Target: ESP32-WROOM-32E.
 
-| Function | GPIO |
-|---|---:|
-| Relay 1 | GPIO16 |
-| Status LED | GPIO23 |
-| PWM output | GPIO25 |
+| Function | GPIO | Logic |
+|---|---:|---|
+| Relay 1 | 16 | HIGH = ON, LOW = OFF |
+| Status LED | 23 | HIGH = ON, LOW = OFF |
+| PWM output | 25 | 3.3 V output to the inverting transistor driver |
+| Physical emergency reset | 0 | Onboard button to GND, active LOW |
 
-Relay logic is based on the supplied AliExpress example:
+The measured working PWM settings are:
 
-- HIGH = relay ON
-- LOW = relay OFF
+- Frequency: 100 Hz.
+- Resolution: 10 bit.
+- OPEN: 85 % duty on the vehicle side.
+- The transistor stage inverts the signal, so GPIO25 produces approximately 15 % HIGH duty for OPEN.
 
-PWM is initially configured as:
+`OPEN_PWM_DUTY_PERCENT` describes the vehicle-side duty. `pwmOff()` sets the ESP32 duty to zero, leaving GPIO25 LOW. After the inverting driver this corresponds to a constant HIGH level; AUTO relies on the relay returning control to the original vehicle controller.
 
-- Frequency: 100 Hz
-- Resolution: 10 bit
-- OPEN: 100 %
+GPIO25 must connect through the intended transistor/driver stage, not directly to the vehicle's 12 V PWM line.
 
-## Modes
+## Modes and startup
 
-### AUTO
-- Relay OFF
-- PWM OFF
-- Original vehicle controller remains in control
+| Mode | Relay | ESP32 PWM | Status LED |
+|---|---|---|---|
+| AUTO | OFF | GPIO25 held LOW | OFF |
+| OPEN | ON | 100 Hz, approximately 15 % GPIO duty / 85 % vehicle duty | ON |
 
-### OPEN
-- Relay ON
-- PWM = `OPEN_PWM_DUTY_PERCENT`
+PWM setup is checked; Arduino-ESP32 3.x write results are checked as well. If PWM cannot be configured or a reported write failure occurs, OPEN is rejected or the outputs fall back to AUTO. The HTTP status exposes `pwmReady` so the web page can report the fault.
 
-### MANUAL
-- Relay ON
-- PWM controlled by the 0–100 % slider
+With **Remember last setting** disabled, the controller starts in AUTO. With it enabled, AUTO/OPEN changes are stored in ESP32 NVS and restored on the next normal boot. Outputs are applied before storing the new mode. Storage errors are reported, so a mode may already be active even when saving it for the next boot fails.
 
-# ESP32 Exhaust Controller – Emergency OFF
+Missing NVS namespaces or keys use normal first-boot defaults. Other errors reading the emergency state keep Wi-Fi OFF with AUTO outputs; errors reading mode preferences fall back to AUTO.
 
-The red EMERGENCY OFF button is shown at the top of the web UI.
+## Emergency OFF
 
-After confirmation:
-- Relay OFF
-- PWM OFF
-- Status LED OFF
-- HTTP server stopped
-- Wi-Fi AP disabled
-- ESP32 remains powered
+The web page's emergency button requests this sequence:
 
-A reset or power cycle is required to start again.
+1. Relay OFF, PWM LOW, status LED OFF.
+2. Store the emergency latch in NVS.
+3. Send a response reporting the emergency and persistence result.
+4. Stop HTTP, mDNS and the Wi-Fi access point.
 
-Configure:
-```cpp
-#define EMERGENCY_ENABLED true
-```
+The web page shows a confirmed shutdown only after receiving a valid emergency response. If the connection drops before that response arrives, it reports that confirmation is missing. If storing the latch fails, the outputs still switch to AUTO and communication stops, but a power cycle may lose the emergency latch.
 
-This is a software shutdown, not a physical power disconnect.
+After a successfully stored emergency, reset or power cycling keeps the outputs in AUTO and Wi-Fi OFF. To clear it, keep the ESP32 powered, release the onboard GPIO0 button, then press and hold it continuously for 5 seconds. Wi-Fi restarts in AUTO only if clearing the stored latch succeeds.
 
-## First test
+The remembered startup mode is preserved when clearing an emergency. For example, if OPEN was remembered beforehand, the physical reset returns to AUTO immediately, but a later normal power cycle restores OPEN.
 
-1. Install the ESP32 board package in Arduino IDE.
-2. Open `ESP32_Exhaust_Controller.ino`.
-3. Select the correct ESP32-WROOM-32E board.
-4. Upload.
-5. Open Serial Monitor at 115200 baud.
-6. Connect your phone to Wi-Fi:
-   - SSID: `Auspuff-ESP32`
-   - Password: `Auspuff123`
-7. Open `http://192.168.4.1`.
+GPIO0 also selects the ESP32 boot mode. Keep the button released when powering on or resetting the board; holding it LOW during reset enters the download bootloader instead of running this firmware.
 
-## Important electrical note
+Emergency OFF is a software shutdown that returns control to the original vehicle controller. The ESP32 remains powered.
 
-GPIO25 is a 3.3 V logic output. Do NOT connect GPIO25 directly to the vehicle's 12 V PWM line.
+## Upload and connect
 
-Use the transistor/driver circuit between GPIO25 and the 12 V circuit. The exact circuit should be checked against the transistor you purchased and the input requirements of the vehicle controller.
+1. Install the Arduino-ESP32 board package in Arduino IDE.
+2. Open `esp32-exhaust-control.ino` and select the appropriate ESP32-WROOM-32E board and port.
+3. Upload the sketch.
+4. Connect your phone to the access point:
+   - SSID: `WiFi`
+   - Password: `Exhaust123`
+5. Open `http://192.168.4.1` or `http://exhaust.local`.
 
-## Later oscilloscope calibration
+The access point does not advertise a default gateway over DHCP, allowing local controller access while the phone can continue using mobile data for internet traffic. The direct IP address is available if the phone does not resolve the mDNS hostname.
 
-After measuring the original signal, adjust:
+Serial debug output is disabled by default. For firmware diagnostics, set `SERIAL_OUTPUT_ENABLED` to `true` and open Serial Monitor at 115200 baud.
+
+## Configuration
+
+The main settings are defined near the start of the sketch:
 
 ```cpp
+#define SERIAL_OUTPUT_ENABLED   false
 #define PWM_FREQUENCY_HZ        100
-#define OPEN_PWM_DUTY_PERCENT   100
-```
-
-If the vehicle controller expects, for example, 10 % for closed and 87 % for open, the software can later be changed to map the 0–100 % slider to that measured range.
-
-## Optional failsafe
-
-Currently disabled:
-
-```cpp
-#define FAILSAFE_ENABLED false
-```
-
-If enabled, the ESP32 switches back to AUTO when no browser heartbeat has been received for 30 seconds:
-
-```cpp
-#define FAILSAFE_ENABLED        true
+#define PWM_RESOLUTION_BITS     10
+#define OPEN_PWM_DUTY_PERCENT   85
+#define EMERGENCY_ENABLED       true
+#define EMERGENCY_RESET_HOLD_MS 5000UL
+#define FAILSAFE_ENABLED        false
 #define FAILSAFE_TIMEOUT_MS     30000UL
 ```
 
-This is intentionally disabled in the first version so that behavior is not changed beyond what was requested.
+The optional communication failsafe remains disabled. When enabled, OPEN returns to AUTO if no browser heartbeat arrives for 30 seconds. The web page sends a heartbeat every 5 seconds. Phone backgrounding or suspension can stop these heartbeats; account for that behavior before enabling the failsafe.
 
-## Notes
+HTML, CSS and JavaScript remain embedded in the sketch. The web page communicates with the local `/api/status`, `/api/mode`, `/api/preferences`, `/api/emergency` and `/api/heartbeat` endpoints. Status also exposes `persistenceOk` for storage diagnostics.
 
-The web page is embedded in the ESP32 firmware. No internet connection or external web server is required.
+## Manual verification
+
+Use a bench setup to check these behaviors before connecting to the vehicle:
+
+1. Switch between AUTO and OPEN. Verify relay and LED states, and measure 100 Hz / approximately 15 % HIGH duty at GPIO25 and 85 % after the inverting driver in OPEN.
+2. With remembering disabled, reboot after OPEN and verify AUTO. Enable remembering, select OPEN, reboot and verify that OPEN is restored.
+3. Trigger Emergency OFF. Verify the outputs switch to AUTO, then Wi-Fi disappears. Power cycle and verify the stored emergency keeps Wi-Fi OFF. Release the button, hold it for 5 seconds, and verify Wi-Fi returns in AUTO.
+4. Disconnect Wi-Fi before sending an emergency request. Verify the browser reports missing confirmation and does not claim a confirmed shutdown.
+5. In a fault-injection test build, force PWM setup/write and NVS write failures. Verify OPEN cannot keep the relay ON after a PWM fault; persistence errors are reported; and a failed emergency-latch clear does not restart Wi-Fi.
