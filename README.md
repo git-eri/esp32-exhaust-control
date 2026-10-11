@@ -59,23 +59,36 @@ Emergency OFF is a software shutdown that returns control to the original vehicl
 ## Upload and connect
 
 1. Install the Arduino-ESP32 board package in Arduino IDE.
-2. Open `esp32-exhaust-control.ino` and select the appropriate ESP32-WROOM-32E board and port.
-3. Upload the sketch.
-4. Connect your phone to the access point:
+2. Copy `config.example.h` to `config.h` in the sketch directory and adjust your local settings as described below.
+3. Open `esp32-exhaust-control.ino` and select the appropriate ESP32-WROOM-32E board and port.
+4. Upload the sketch.
+5. Connect your phone to the access point (default credentials):
    - SSID: `WiFi`
    - Password: `Exhaust123`
-5. Open `http://192.168.4.1` or `http://exhaust.local`.
+6. Open `http://192.168.4.1` or `http://exhaust.local` (default hostname).
 
 The access point does not advertise a default gateway over DHCP, allowing local controller access while the phone can continue using mobile data for internet traffic. The direct IP address is available if the phone does not resolve the mDNS hostname.
 
-Serial debug output is disabled by default. For firmware diagnostics, set `SERIAL_OUTPUT_ENABLED` to `true` and open Serial Monitor at 115200 baud.
+Serial debug output is enabled by default. Open Serial Monitor at 115200 baud for firmware diagnostics, or set `SERIAL_OUTPUT_ENABLED` to `false` in `config.h` for a silent UART.
 
 ## Configuration
 
-The main settings are defined near the start of the sketch:
+All configurable defines live in `config.h`, including serial output, GPIO pins and logic levels, PWM, Wi-Fi credentials and mDNS, failsafe, emergency reset and NVS names. The sketch includes this file directly.
+
+`config.example.h` contains the defaults and is kept in Git. After cloning, create your local configuration once, for example in PowerShell:
+
+```powershell
+Copy-Item -LiteralPath config.example.h -Destination config.h
+```
+
+Then edit only `config.h`. It is excluded by `.gitignore`, so local settings and passwords are omitted from normal `git add` and commits. Git can still include an ignored file if explicitly forced with `git add -f`; do not force-add `config.h`. Ignoring a file already tracked by Git would not hide its changes, which is why the template and local file are separate.
+
+`config.h` is required for compilation. When the template gains new settings, add those defines to your local file without replacing your existing values. Change `config.example.h` only when updating the shared defaults.
+
+Some of the default values are:
 
 ```cpp
-#define SERIAL_OUTPUT_ENABLED   false
+#define SERIAL_OUTPUT_ENABLED   true
 #define PWM_FREQUENCY_HZ        100
 #define PWM_RESOLUTION_BITS     10
 #define OPEN_PWM_DUTY_PERCENT   85
@@ -87,7 +100,9 @@ The main settings are defined near the start of the sketch:
 
 The optional communication failsafe remains disabled. When enabled, OPEN returns to AUTO if no browser heartbeat arrives for 30 seconds. The web page sends a heartbeat every 5 seconds. Phone backgrounding or suspension can stop these heartbeats; account for that behavior before enabling the failsafe.
 
-HTML, CSS and JavaScript remain embedded in the sketch. The web page communicates with the local `/api/status`, `/api/mode`, `/api/preferences`, `/api/emergency` and `/api/heartbeat` endpoints. Status also exposes `persistenceOk` for storage diagnostics.
+The web page's HTML, CSS and JavaScript live in `web_ui.h`, which defines `INDEX_HTML` in program memory (`PROGMEM`). The sketch includes this header and compiles the page into the firmware. To change the web UI, edit `web_ui.h`, then rebuild and upload the sketch; no separate web file upload is required.
+
+The web page communicates with the local `/api/status`, `/api/mode`, `/api/preferences`, `/api/emergency` and `/api/heartbeat` endpoints. Status also exposes `persistenceOk` for storage diagnostics.
 
 ## Manual verification
 
